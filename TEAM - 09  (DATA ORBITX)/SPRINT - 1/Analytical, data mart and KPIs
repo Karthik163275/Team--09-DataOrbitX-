@@ -1,0 +1,174 @@
+-- =========================================================================
+-- 5. ORCHESTRATION (Tasks)
+-- =========================================================================
+
+
+CREATE OR REPLACE TASK analytical.task_process_dq
+    WAREHOUSE = HEALTHCARE_WH
+    SCHEDULE = '1 MINUTE'
+    WHEN SYSTEM$STREAM_HAS_DATA('RAW.PATIENTS_STREAM')
+      OR SYSTEM$STREAM_HAS_DATA('RAW.APPOINTMENTS_STREAM')
+      OR SYSTEM$STREAM_HAS_DATA('RAW.MEDICAL_RECORDS_STREAM')
+      OR SYSTEM$STREAM_HAS_DATA('RAW.BILLING_STREAM')
+AS
+    CALL validated.process_data_quality();
+
+CREATE OR REPLACE TASK analytical.task_populate_curated
+    WAREHOUSE = HEALTHCARE_WH
+    AFTER analytical.task_process_dq
+AS 
+    CALL curated.populate_curated_models();
+
+CREATE OR REPLACE TASK analytical.task_anomaly_engine
+    WAREHOUSE = HEALTHCARE_WH
+    AFTER analytical.task_populate_curated
+AS 
+    CALL governance.run_anomaly_engine();
+
+ALTER TASK analytical.task_anomaly_engine RESUME;
+ALTER TASK analytical.task_populate_curated RESUME;
+ALTER TASK analytical.task_process_dq RESUME;
+
+
+-- =========================================================================
+-- 6. DATAMART LAYER (Solving the Prompt Requests)
+-- =========================================================================
+
+-- Requirement 1: Patient 360
+CREATE OR REPLACE VIEW datamart.patient_360_mart AS
+SELECT 
+    p.patient_key,
+    p.patient_id,
+    p.full_name,
+    DATEDIFF('year', p.dob, CURRENT_DATE()) AS age,
+    p.gender,
+    p.city,
+    COUNT(DISTINCT a.appointment_id) AS lifetime_appointments,
+    COUNT(DISTINCT m.record_id) AS lifetime_medical_records,
+    SUM(b.total_amount) AS lifetime_billing,
+    SUM(b.patient_paid) AS lifetime_out_of_pocket
+FROM curated.dim_patient p
+LEFT JOIN curated.fact_appointments a ON p.patient_key = a.patient_key
+LEFT JOIN curated.fact_medical_records m ON p.patient_key = m.patient_key
+LEFT JOIN curated.fact_billing b ON p.patient_key = b.patient_key
+WHERE p.is_current = TRUE
+GROUP BY p.patient_key, p.patient_id, p.full_name, p.dob, p.gender, p.city;
+
+
+-- Requirement 2: Risk Prediction Analysis
+CREATE OR REPLACE VIEW datamart.risk_prediction_mart AS
+SELECT 
+    p.patient_id,
+    p.full_name,
+    DATEDIFF('year', p.dob, CURRENT_DATE()) AS age,
+    m.diagnosis,
+    m.cholesterol_level,
+    m.blood_pressure_systolic,
+    CASE 
+        WHEN DATEDIFF('year', p.dob, CURRENT_DATE()) > 60 AND m.cholesterol_level > 240 AND m.blood_pressure_systolic > 140 THEN 'HIGH RISK'
+        WHEN m.cholesterol_level BETWEEN 200 AND 240 OR m.blood_pressure_systolic BETWEEN 120 AND 140 THEN 'MEDIUM RISK'
+        ELSE 'LOW RISK'
+    END AS health_risk_score,
+    m.record_date
+FROM curated.dim_patient p
+JOIN curated.fact_medical_records m ON p.patient_key = m.patient_key
+WHERE p.is_current = TRUE;
+
+
+-- Requirement 3: Revenue Trends
+CREATE OR REPLACE VIEW datamart.revenue_trends_mart AS
+SELECT 
+    DATE_TRUNC('month', b.billing_date) AS revenue_month,
+    a.department,
+    COUNT(DISTINCT b.bill_id) AS total_bills_issued,
+    SUM(b.total_amount) AS total_revenue,
+    SUM(b.insurance_covered) AS total_insurance_claims
+FROM curated.fact_billing b
+JOIN curated.fact_appointments a ON b.appointment_key = a.appointment_key
+GROUP BY revenue_month, a.department;
+
+
+-- Requirement 4: No-Show Analysis
+CREATE OR REPLACE VIEW datamart.no_show_mart AS
+SELECT 
+    department,
+    COUNT(*) AS total_appointments,
+    SUM(IFF(status = 'No-Show', 1, 0)) AS total_missed_appointments,
+    ROUND((SUM(IFF(status = 'No-Show', 1, 0)) * 100.0) / NULLIF(COUNT(*), 0), 2) AS no_show_rate_percent
+FROM curated.fact_appointments
+GROUP BY department;
+
+
+-- =========================================================================
+-- 7. ANALYTICAL LAYER (Actionable KPIs for Dashboards)
+-- =========================================================================
+
+-- KPI 1: Enterprise Health Risk Ratio
+CREATE OR REPLACE VIEW analytical.kpi_health_risk AS
+SELECT 
+    COUNT(IFF(health_risk_score = 'HIGH RISK', 1, NULL)) AS total_high_risk_patients,
+    COUNT(*) AS total_patients_analyzed,
+    ROUND((COUNT(IFF(health_risk_score = 'HIGH RISK', 1, NULL)) * 100.0) / NULLIF(COUNT(*), 0), 2) AS high_risk_percentage
+FROM datamart.risk_prediction_mart;
+
+select * from analytical.kpi_top_departments;
+-- KPI 2: Top Performing Departments (Financial)
+CREATE OR REPLACE VIEW analytical.kpi_top_departments AS
+SELECT 
+    department,
+    SUM(total_revenue) AS ytd_revenue,
+    SUM(total_insurance_claims) AS ytd_insurance_claims
+FROM datamart.revenue_trends_mart
+GROUP BY department
+ORDER BY ytd_revenue DESC;
+
+-- KPI 3: Operational Inefficiency (No Shows)
+CREATE OR REPLACE VIEW analytical.kpi_operational_inefficiency AS
+SELECT 
+    department,
+    total_missed_appointments,
+    no_show_rate_percent
+FROM datamart.no_show_mart
+ORDER BY no_show_rate_percent DESC;
+
+-- KPI 4: Governance Quality Score
+CREATE OR REPLACE VIEW analytical.kpi_data_quality AS
+SELECT 
+    source_table,
+    error_type,
+    COUNT(error_id) AS total_anomalies_quarantined
+FROM governance.dq_exception_log
+GROUP BY source_table, error_type
+ORDER BY total_anomalies_quarantined DESC;
+
+-- END OF SCRIPT
+
+-- =========================================================================
+-- 8. SYSTEM ALERTS (Proactive Monitoring)
+-- =========================================================================
+
+-- Create an alert to notify admins if any business anomalies are detected
+CREATE OR REPLACE ALERT governance.high_anomaly_alert
+  WAREHOUSE = HEALTHCARE_WH
+  SCHEDULE = '10 MINUTE'
+  IF (EXISTS (
+      SELECT * 
+      FROM governance.anomaly_rule_hits 
+      WHERE detected_at > SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME()
+  ))
+  THEN
+    -- Action: Send an email (Note: Requires a pre-configured email integration 'my_email_int')
+    CALL SYSTEM$SEND_EMAIL(
+        'my_email_int', 
+        'admin@hospital.com', 
+        'High Anomalies Detected', 
+        'Check governance.anomaly_rule_hits immediately for business rule violations.'
+    );
+
+ALTER ALERT governance.high_anomaly_alert RESUME;
+
+
+select * from analytical.kpi_top_departments;
+select * from analytical.kpi_health_risk;
+select * from analytical.kpi_operational_inefficiency;
+select * from analytical.kpi_data_quality;
