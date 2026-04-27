@@ -1,0 +1,39 @@
+- =========================================================================
+-- 4. GOVERNANCE (Anomaly Engine)
+-- =========================================================================
+CREATE OR REPLACE PROCEDURE governance.run_anomaly_engine()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    BEGIN TRANSACTION;
+    -- Duplicate Appointments (Patient booked twice in same day)
+    INSERT INTO governance.anomaly_rule_hits (rule_name, business_key, anomaly_desc)
+    SELECT 'DOUBLE_BOOKED', patient_key, CONCAT('Patient booked twice on ', DATE(appointment_date))
+    FROM curated.fact_appointments
+    WHERE status != 'No-Show'
+    GROUP BY patient_key, DATE(appointment_date) HAVING COUNT(appointment_id) > 1;
+
+    -- Extreme Billing Outliers (> 3 Standard Deviations)
+    INSERT INTO governance.anomaly_rule_hits (rule_name, business_key, anomaly_desc)
+    WITH DeptAvg AS (
+        SELECT a.department, AVG(b.total_amount) as avg_amt, STDDEV(b.total_amount) as std_dev
+        FROM curated.fact_billing b JOIN curated.fact_appointments a ON b.appointment_key = a.appointment_key GROUP BY a.department
+    )
+    SELECT 'BILL_OUTLIER', b.bill_id, CONCAT('Amount ', b.total_amount, ' exceeds dept avg ', d.avg_amt)
+    FROM curated.fact_billing b
+    JOIN curated.fact_appointments a ON b.appointment_key = a.appointment_key
+    JOIN DeptAvg d ON a.department = d.department
+    WHERE b.total_amount > (d.avg_amt + (3 * COALESCE(d.std_dev, 1)));
+
+    COMMIT;
+    RETURN 'Anomaly Engine run executed.';
+EXCEPTION
+    WHEN OTHER THEN
+        ROLLBACK;
+        RETURN 'Error in run_anomaly_engine: ' || SQLERRM;
+END;
+$$;
+
+
