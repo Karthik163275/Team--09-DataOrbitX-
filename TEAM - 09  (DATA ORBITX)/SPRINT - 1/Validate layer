@@ -1,0 +1,166 @@
+-- =========================================================================
+-- 2. VALIDATED LAYER (Data Cleaning & DQ Logging)
+-- =========================================================================
+CREATE OR REPLACE TABLE validated.valid_patients (
+    patient_id VARCHAR PRIMARY KEY,
+    first_name VARCHAR,
+    last_name VARCHAR,
+    dob DATE,
+    gender VARCHAR,
+    blood_group VARCHAR,
+    city VARCHAR,
+    state VARCHAR,
+    registration_date TIMESTAMP_NTZ,
+    _load_timestamp TIMESTAMP_NTZ
+);
+
+CREATE OR REPLACE TABLE validated.valid_appointments (
+    appointment_id VARCHAR PRIMARY KEY,
+    patient_id VARCHAR,
+    appointment_date TIMESTAMP_NTZ,
+    department VARCHAR,
+    doctor_id VARCHAR,
+    status VARCHAR,
+    _load_timestamp TIMESTAMP_NTZ
+);
+
+CREATE OR REPLACE TABLE validated.valid_medical_records (
+    record_id VARCHAR PRIMARY KEY,
+    patient_id VARCHAR,
+    diagnosis VARCHAR,
+    heart_rate NUMBER,
+    blood_pressure_systolic NUMBER,
+    blood_pressure_diastolic NUMBER,
+    cholesterol_level NUMBER,
+    record_date TIMESTAMP_NTZ,
+    _load_timestamp TIMESTAMP_NTZ
+);
+
+CREATE OR REPLACE TABLE validated.valid_billing (
+    bill_id VARCHAR PRIMARY KEY,
+    patient_id VARCHAR,
+    appointment_id VARCHAR,
+    total_amount FLOAT,
+    insurance_covered FLOAT,
+    patient_paid FLOAT,
+    billing_date TIMESTAMP_NTZ,
+    status VARCHAR,
+    _load_timestamp TIMESTAMP_NTZ
+);
+
+-- Governance Exception Tables
+CREATE OR REPLACE TABLE governance.dq_exception_log (
+    error_id VARCHAR DEFAULT UUID_STRING(),
+    source_table VARCHAR,
+    business_key VARCHAR,
+    error_type VARCHAR,
+    error_message VARCHAR,
+    _recorded_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE TABLE governance.anomaly_rule_hits (
+    anomaly_id VARCHAR DEFAULT UUID_STRING(),
+    rule_name VARCHAR,
+    business_key VARCHAR,
+    anomaly_desc VARCHAR,
+    detected_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Stored Procedure for DQ and Merging
+CREATE OR REPLACE PROCEDURE validated.process_data_quality()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    BEGIN TRANSACTION;
+    -- 1. PROCESS PATIENTS
+    CREATE TEMPORARY TABLE cur_patients_stream AS SELECT * FROM raw.patients_stream WHERE METADATA$ACTION = 'INSERT';
+    
+    INSERT INTO governance.dq_exception_log (source_table, business_key, error_type, error_message)
+    SELECT 'raw_patients', patient_id, 'NULL_VALUES', 'Missing Gender or City'
+    FROM cur_patients_stream WHERE gender IS NULL OR city IS NULL;
+
+    MERGE INTO validated.valid_patients tgt
+    USING (
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY patient_id ORDER BY _load_timestamp DESC) as rn
+            FROM cur_patients_stream WHERE gender IS NOT NULL AND city IS NOT NULL
+        ) WHERE rn = 1
+    ) src ON tgt.patient_id = src.patient_id
+    WHEN MATCHED THEN UPDATE SET tgt.first_name = UPPER(src.first_name), tgt.last_name = UPPER(src.last_name), tgt.city = UPPER(src.city), tgt.state = UPPER(src.state), tgt.gender = src.gender, tgt.blood_group = src.blood_group
+    WHEN NOT MATCHED THEN INSERT (patient_id, first_name, last_name, dob, gender, blood_group, city, state, registration_date, _load_timestamp)
+    VALUES (src.patient_id, UPPER(src.first_name), UPPER(src.last_name), src.dob, src.gender, src.blood_group, UPPER(src.city), UPPER(src.state), src.registration_date, src._load_timestamp);
+
+    -- 2. PROCESS APPOINTMENTS
+    CREATE TEMPORARY TABLE cur_appointments_stream AS SELECT * FROM raw.appointments_stream WHERE METADATA$ACTION = 'INSERT';
+    
+    INSERT INTO governance.dq_exception_log (source_table, business_key, error_type, error_message)
+    SELECT 'raw_appointments', appointment_id, 'INVALID_STATUS', CONCAT('Status ', status, ' is invalid')
+    FROM cur_appointments_stream WHERE status NOT IN ('Scheduled', 'Completed', 'No-Show');
+
+    MERGE INTO validated.valid_appointments tgt
+    USING (
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY appointment_id ORDER BY _load_timestamp DESC) as rn
+            FROM cur_appointments_stream 
+            WHERE status IN ('Scheduled', 'Completed', 'No-Show')
+              AND patient_id IN (SELECT patient_id FROM validated.valid_patients)
+        ) WHERE rn = 1
+    ) src ON tgt.appointment_id = src.appointment_id
+    WHEN MATCHED THEN UPDATE SET tgt.status = src.status, tgt.appointment_date = src.appointment_date
+    WHEN NOT MATCHED THEN INSERT (appointment_id, patient_id, appointment_date, department, doctor_id, status, _load_timestamp)
+    VALUES (src.appointment_id, src.patient_id, src.appointment_date, UPPER(src.department), src.doctor_id, src.status, src._load_timestamp);
+
+    -- 3. PROCESS MEDICAL RECORDS
+    CREATE TEMPORARY TABLE cur_medical_stream AS SELECT * FROM raw.medical_records_stream WHERE METADATA$ACTION = 'INSERT';
+
+    INSERT INTO governance.dq_exception_log (source_table, business_key, error_type, error_message)
+    SELECT 'raw_medical_records', record_id, 'DATA_TYPE_ERROR', 'Non-numeric clinical values'
+    FROM cur_medical_stream 
+    WHERE TRY_CAST(cholesterol_level AS NUMBER) IS NULL OR TRY_CAST(heart_rate AS NUMBER) IS NULL;
+
+    MERGE INTO validated.valid_medical_records tgt
+    USING (
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY record_id ORDER BY _load_timestamp DESC) as rn
+            FROM cur_medical_stream
+            WHERE TRY_CAST(cholesterol_level AS NUMBER) IS NOT NULL
+              AND TRY_CAST(heart_rate AS NUMBER) IS NOT NULL
+              AND patient_id IN (SELECT patient_id FROM validated.valid_patients)
+        ) WHERE rn = 1
+    ) src ON tgt.record_id = src.record_id
+    WHEN MATCHED THEN UPDATE SET tgt.diagnosis = src.diagnosis, tgt.heart_rate = TRY_CAST(src.heart_rate AS NUMBER)
+    WHEN NOT MATCHED THEN INSERT (record_id, patient_id, diagnosis, heart_rate, blood_pressure_systolic, blood_pressure_diastolic, cholesterol_level, record_date, _load_timestamp)
+    VALUES (src.record_id, src.patient_id, src.diagnosis, TRY_CAST(src.heart_rate AS NUMBER), TRY_CAST(src.blood_pressure_systolic AS NUMBER), TRY_CAST(src.blood_pressure_diastolic AS NUMBER), TRY_CAST(src.cholesterol_level AS NUMBER), src.record_date, src._load_timestamp);
+
+    -- 4. PROCESS BILLING
+    CREATE TEMPORARY TABLE cur_billing_stream AS SELECT * FROM raw.billing_stream WHERE METADATA$ACTION = 'INSERT';
+
+    INSERT INTO governance.dq_exception_log (source_table, business_key, error_type, error_message)
+    SELECT 'raw_billing', bill_id, 'VALUE_ERROR', 'Negative or missing amount'
+    FROM cur_billing_stream WHERE TRY_CAST(total_amount AS FLOAT) < 0 OR TRY_CAST(total_amount AS FLOAT) IS NULL;
+
+    MERGE INTO validated.valid_billing tgt
+    USING (
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY bill_id ORDER BY _load_timestamp DESC) as rn
+            FROM cur_billing_stream
+            WHERE TRY_CAST(total_amount AS FLOAT) >= 0
+              AND appointment_id IN (SELECT appointment_id FROM validated.valid_appointments)
+        ) WHERE rn = 1
+    ) src ON tgt.bill_id = src.bill_id
+    WHEN MATCHED THEN UPDATE SET tgt.status = src.status, tgt.total_amount = TRY_CAST(src.total_amount AS FLOAT)
+    WHEN NOT MATCHED THEN INSERT (bill_id, patient_id, appointment_id, total_amount, insurance_covered, patient_paid, billing_date, status, _load_timestamp)
+    VALUES (src.bill_id, src.patient_id, src.appointment_id, TRY_CAST(src.total_amount AS FLOAT), TRY_CAST(src.insurance_covered AS FLOAT), TRY_CAST(src.patient_paid AS FLOAT), src.billing_date, src.status, src._load_timestamp);
+
+    COMMIT;
+    RETURN 'Validation and Insert into VALIDATED layer completed successfully.';
+EXCEPTION
+    WHEN OTHER THEN
+        ROLLBACK;
+        RETURN 'Error in process_data_quality: ' || SQLERRM;
+END;
+$$;
+
+
