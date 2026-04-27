@@ -1,0 +1,109 @@
+CREATE OR REPLACE DATABASE HEALTHCARE_ADVANCED_DB;
+USE DATABASE HEALTHCARE_ADVANCED_DB;
+
+CREATE OR REPLACE WAREHOUSE HEALTHCARE_WH
+WITH WAREHOUSE_SIZE='X-SMALL' 
+AUTO_SUSPEND=60 
+AUTO_RESUME=TRUE ;
+USE WAREHOUSE HEALTHCARE_WH;
+
+CREATE OR REPLACE SCHEMA raw;
+CREATE OR REPLACE SCHEMA validated;
+CREATE OR REPLACE SCHEMA curated;
+CREATE OR REPLACE SCHEMA external_stages;
+CREATE OR REPLACE SCHEMA governance;
+CREATE OR REPLACE SCHEMA datamart;
+CREATE OR REPLACE SCHEMA analytical;
+
+-- =========================================================================
+-- 1. RAW LAYER & INGESTION
+-- =========================================================================
+CREATE OR REPLACE FILE FORMAT raw.csv_format
+  TYPE = 'CSV'
+  FIELD_DELIMITER = ','
+  SKIP_HEADER = 1
+  NULL_IF = ('', 'NULL', 'null')
+  EMPTY_FIELD_AS_NULL = TRUE
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"';
+
+CREATE OR REPLACE STAGE external_stages.healthcare_stage;
+
+-- Raw Tables
+CREATE OR REPLACE TABLE raw.raw_patients (
+    patient_id VARCHAR,
+    first_name VARCHAR,
+    last_name VARCHAR,
+    dob DATE,
+    gender VARCHAR,
+    blood_group VARCHAR,
+    city VARCHAR,
+    state VARCHAR,
+    registration_date TIMESTAMP_NTZ,
+    _load_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE TABLE raw.raw_appointments (
+    appointment_id VARCHAR,
+    patient_id VARCHAR,
+    appointment_date TIMESTAMP_NTZ,
+    department VARCHAR,
+    doctor_id VARCHAR,
+    status VARCHAR,
+    _load_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE TABLE raw.raw_medical_records (
+    record_id VARCHAR,
+    patient_id VARCHAR,
+    diagnosis VARCHAR,
+    heart_rate VARCHAR, -- Read as varchar to catch bad cast
+    blood_pressure_systolic VARCHAR,
+    blood_pressure_diastolic VARCHAR,
+    cholesterol_level VARCHAR,
+    record_date TIMESTAMP_NTZ,
+    _load_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE TABLE raw.raw_billing (
+    bill_id VARCHAR,
+    patient_id VARCHAR,
+    appointment_id VARCHAR,
+    total_amount VARCHAR,
+    insurance_covered VARCHAR,
+    patient_paid VARCHAR,
+    billing_date TIMESTAMP_NTZ,
+    status VARCHAR,
+    _load_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+
+-- Streams
+CREATE OR REPLACE STREAM raw.patients_stream ON TABLE raw.raw_patients;
+CREATE OR REPLACE STREAM raw.appointments_stream ON TABLE raw.raw_appointments;
+CREATE OR REPLACE STREAM raw.medical_records_stream ON TABLE raw.raw_medical_records;
+CREATE OR REPLACE STREAM raw.billing_stream ON TABLE raw.raw_billing;
+
+-- COPY INTO Commands (Execute these after uploading CSVs to @external_stages.healthcare_stage)
+COPY INTO raw.raw_patients (patient_id, first_name, last_name, dob, gender, blood_group, city, state, registration_date)
+FROM @external_stages.healthcare_stage
+FILE_FORMAT = raw.csv_format
+PATTERN = '.patients.\.csv'
+ON_ERROR = CONTINUE;
+
+COPY INTO raw.raw_appointments (appointment_id, patient_id, appointment_date, department, doctor_id, status)
+FROM @external_stages.healthcare_stage
+FILE_FORMAT = raw.csv_format
+PATTERN = '.appointments.\.csv'
+ON_ERROR = CONTINUE;
+
+COPY INTO raw.raw_medical_records (record_id, patient_id, diagnosis, heart_rate, blood_pressure_systolic, blood_pressure_diastolic, cholesterol_level, record_date)
+FROM @external_stages.healthcare_stage
+FILE_FORMAT = raw.csv_format
+PATTERN = '.medical_records.\.csv'
+ON_ERROR = CONTINUE;
+
+COPY INTO raw.raw_billing (bill_id, patient_id, appointment_id, total_amount, insurance_covered, patient_paid, billing_date, status)
+FROM @external_stages.healthcare_stage
+FILE_FORMAT = raw.csv_format
+PATTERN = '.billing.\.csv'
+ON_ERROR = CONTINUE;
