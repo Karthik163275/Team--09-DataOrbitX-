@@ -1,0 +1,16 @@
+<?xml version = '1.0' encoding = 'UTF-8'?>
+<OSDM_Design class="oracle.dbtools.crest.model.design.Design" name="karthik" id="1EEFAED1-FF0B-83AF-34E4-D63E9C50F4B6" version="3.5">
+<createdBy>manokarthik</createdBy>
+<createdTime>2026-04-27 10:00:29 UTC</createdTime>
+<ownerDesignName>karthik</ownerDesignName>
+<capitalNames>false</capitalNames>
+<designId>1EEFAED1-FF0B-83AF-34E4-D63E9C50F4B6</designId>
+<usedDesignStorageDescriptors>
+<designDescr class="oracle.dbtools.crest.model.design.Design$DesignStorageDesc" id="A8DF0141-60F0-71C3-42BC-33CE217C9EF4">
+<designStoragePath>/healthcare_data_mart</designStoragePath>
+</designDescr>
+<designDescr class="oracle.dbtools.crest.model.design.Design$DesignStorageDesc" id="C1FF1BB1-B4BF-5DD9-0F65-F58A71291D7A">
+<designStoragePath>/Healthcare_Model_Updated_v2</designStoragePath>
+</designDescr>
+</usedDesignStorageDescriptors>
+</OSDM_Design>
