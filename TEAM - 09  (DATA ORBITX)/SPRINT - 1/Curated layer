@@ -1,0 +1,145 @@
+-- =========================================================================
+-- 3. CURATED LAYER (Dimensions & Facts with Surrogate Keys)
+-- =========================================================================
+
+-- SCD-2 Patient Dimension
+CREATE OR REPLACE TABLE curated.dim_patient (
+    patient_key STRING,
+    patient_id STRING,
+    full_name STRING,
+    dob DATE,
+    gender STRING,
+    blood_group STRING,
+    city STRING,
+    state STRING,
+    registration_date TIMESTAMP_NTZ,
+    effective_date DATE,
+    end_date DATE,
+    is_current BOOLEAN
+);
+
+-- Fact Appointments (Event Fact)
+CREATE OR REPLACE TABLE curated.fact_appointments (
+    appointment_key STRING,
+    appointment_id STRING,
+    patient_key STRING,
+    doctor_id STRING,
+    department STRING,
+    appointment_date TIMESTAMP_NTZ,
+    status STRING
+);
+
+-- Fact Medical Records (Metrics Fact)
+CREATE OR REPLACE TABLE curated.fact_medical_records (
+    record_key STRING,
+    record_id STRING,
+    patient_key STRING,
+    diagnosis STRING,
+    heart_rate NUMBER,
+    blood_pressure_systolic NUMBER,
+    blood_pressure_diastolic NUMBER,
+    cholesterol_level NUMBER,
+    record_date TIMESTAMP_NTZ
+);
+
+-- Fact Billing (Financial Fact)
+CREATE OR REPLACE TABLE curated.fact_billing (
+    billing_key STRING,
+    bill_id STRING,
+    appointment_key STRING,
+    patient_key STRING,
+    total_amount FLOAT,
+    insurance_covered FLOAT,
+    patient_paid FLOAT,
+    billing_date TIMESTAMP_NTZ,
+    status STRING
+);
+
+
+CREATE OR REPLACE PROCEDURE curated.populate_curated_models()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    BEGIN TRANSACTION;
+    -- 1. SCD-2 for PATIENT DIMENSION
+    UPDATE curated.dim_patient tgt
+    SET tgt.end_date = CURRENT_DATE(), tgt.is_current = FALSE
+    FROM validated.valid_patients src
+    WHERE tgt.patient_id = src.patient_id 
+      AND tgt.is_current = TRUE 
+      AND (tgt.city != src.city OR tgt.state != src.state);
+
+    MERGE INTO curated.dim_patient tgt
+    USING validated.valid_patients src
+    ON tgt.patient_id = src.patient_id AND tgt.is_current = TRUE
+    WHEN NOT MATCHED THEN 
+      INSERT (patient_key, patient_id, full_name, dob, gender, blood_group, city, state, registration_date, effective_date, end_date, is_current)
+      VALUES (UUID_STRING(), src.patient_id, CONCAT(src.first_name, ' ', src.last_name), src.dob, src.gender, src.blood_group, src.city, src.state, src.registration_date, CURRENT_DATE(), NULL, TRUE);
+
+    -- 2. FACT APPOINTMENTS
+    MERGE INTO curated.fact_appointments tgt
+    USING (
+         SELECT 
+            a.appointment_id,
+            p.patient_key,
+            a.doctor_id,
+            a.department,
+            a.appointment_date,
+            a.status
+         FROM validated.valid_appointments a
+         JOIN curated.dim_patient p ON a.patient_id = p.patient_id AND p.is_current = TRUE
+    ) src ON tgt.appointment_id = src.appointment_id
+    WHEN MATCHED THEN UPDATE SET tgt.status = src.status
+    WHEN NOT MATCHED THEN INSERT (appointment_key, appointment_id, patient_key, doctor_id, department, appointment_date, status)
+    VALUES (UUID_STRING(), src.appointment_id, src.patient_key, src.doctor_id, src.department, src.appointment_date, src.status);
+
+    -- 3. FACT MEDICAL RECORDS
+    MERGE INTO curated.fact_medical_records tgt
+    USING (
+         SELECT 
+            m.record_id,
+            p.patient_key,
+            m.diagnosis,
+            m.heart_rate,
+            m.blood_pressure_systolic,
+            m.blood_pressure_diastolic,
+            m.cholesterol_level,
+            m.record_date
+         FROM validated.valid_medical_records m
+         JOIN curated.dim_patient p ON m.patient_id = p.patient_id AND p.is_current = TRUE
+    ) src ON tgt.record_id = src.record_id
+    WHEN MATCHED THEN UPDATE SET tgt.diagnosis = src.diagnosis, tgt.heart_rate = src.heart_rate
+    WHEN NOT MATCHED THEN INSERT (record_key, record_id, patient_key, diagnosis, heart_rate, blood_pressure_systolic, blood_pressure_diastolic, cholesterol_level, record_date)
+    VALUES (UUID_STRING(), src.record_id, src.patient_key, src.diagnosis, src.heart_rate, src.blood_pressure_systolic, src.blood_pressure_diastolic, src.cholesterol_level, src.record_date);
+
+    -- 4. FACT BILLING
+    MERGE INTO curated.fact_billing tgt
+    USING (
+         SELECT 
+            b.bill_id,
+            fa.appointment_key,
+            p.patient_key,
+            b.total_amount,
+            b.insurance_covered,
+            b.patient_paid,
+            b.billing_date,
+            b.status
+         FROM validated.valid_billing b
+         JOIN curated.dim_patient p ON b.patient_id = p.patient_id AND p.is_current = TRUE
+         LEFT JOIN curated.fact_appointments fa ON b.appointment_id = fa.appointment_id
+    ) src ON tgt.bill_id = src.bill_id
+    WHEN MATCHED THEN UPDATE SET tgt.status = src.status, tgt.patient_paid = src.patient_paid
+    WHEN NOT MATCHED THEN INSERT (billing_key, bill_id, appointment_key, patient_key, total_amount, insurance_covered, patient_paid, billing_date, status)
+    VALUES (UUID_STRING(), src.bill_id, src.appointment_key, src.patient_key, src.total_amount, src.insurance_covered, src.patient_paid, src.billing_date, src.status);
+
+    COMMIT;
+    RETURN 'Curated models populated successfully.';
+EXCEPTION
+    WHEN OTHER THEN
+        ROLLBACK;
+        RETURN 'Error in populate_curated_models: ' || SQLERRM;
+END;
+$$;
+
